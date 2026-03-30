@@ -17,8 +17,8 @@ from InteractionLayer import ModernBertWithTokenMatch
 ## 2. Hyperparameters
 ## =============================================
 MODEL_NAME = "answerdotai/ModernBERT-base"
-EPOCHS = 10
-LR = 2e-5
+EPOCHS = 5
+LR = 1e-5
 BATCH_SIZE = 16
 MAX_LENGTH = 8192
 
@@ -31,8 +31,8 @@ OUTPUT_DIR = "model_save"
 ## =============================================
 def build_model_and_data():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME, num_labels=2)
-    #model = ModernBertWithTokenMatch.from_pretrained(MODEL_NAME, num_labels=2) #주석할때 밑에랑 같이 
+    #model = AutoModelForTokenClassification.from_pretrained(MODEL_NAME, num_labels=2)
+    model = ModernBertWithTokenMatch.from_pretrained(MODEL_NAME, num_labels=2) #주석할때 밑에랑 같이 
     #model.set_token_match(sep_token_id=tokenizer.sep_token_id)
 
     ## [가속화] Gradient Checkpointing — VRAM 절감 (속도 약간 감소 대신 메모리 대폭 절약)
@@ -93,8 +93,22 @@ def train():
     if model is None:
         return
 
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+    # Interaction Layer (token_match, match_feat_norm)에는 5x 높은 LR 적용
+    interaction_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        if 'token_match' in name or 'match_feat_norm' in name:
+            interaction_params.append(param)
+        else:
+            base_params.append(param)
+    
+    INTERACTION_LR = LR * 10  # 1e-4
+    print(f"  Base LR: {LR}, Interaction Layer LR: {INTERACTION_LR}")
+    
+    optimizer = torch.optim.AdamW([
+        {'params': base_params, 'lr': LR, 'weight_decay': 0.05},
+        {'params': interaction_params, 'lr': INTERACTION_LR, 'weight_decay': 0.1},
+    ])
     
     # Scheduler 설정 (Warmup 5%)
     # effective steps = ceil(len(train_loader) / ACC_STEPS) per epoch
@@ -119,7 +133,7 @@ def train():
         "model_name": MODEL_NAME,
         "epochs": EPOCHS,
         "learning_rate": LR,
-       # "interaction_layer_lr": INTERACTION_LR,
+        "interaction_layer_lr": INTERACTION_LR,
         "batch_size": BATCH_SIZE,
         "effective_batch_size": BATCH_SIZE * ACC_STEPS,
         "gradient_accumulation_steps": ACC_STEPS,
