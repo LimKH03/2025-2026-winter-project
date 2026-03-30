@@ -11,13 +11,14 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 class TokenTrainer:
-    def __init__(self, model, optimizer, device, output_dir, evaluator=None, val_data_path=None, scheduler=None, hyperparams=None, accelerator=None):
+    def __init__(self, model, optimizer, device, output_dir, scheduler=None, hyperparams=None, accelerator=None, script_dir="script"):
         self.model = model
         self.optimizer = optimizer
         self.device = device
-        self.output_dir = output_dir
-        self.evaluator = evaluator
-        self.val_data_path = val_data_path
+        # 저장 디렉토리에 현재 날짜+시간(분) 타임스탬프 추가
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        self.output_dir = os.path.join(output_dir, timestamp)
+        self.script_dir = script_dir
         self.scheduler = scheduler
         self.hyperparams = hyperparams or {}
         self.best_val_f1 = 0.0
@@ -34,16 +35,27 @@ class TokenTrainer:
             torch.backends.cuda.matmul.allow_tf32 = True
             ## [가속화] TF32 cuDNN — cuDNN 연산도 TF32 허용
             torch.backends.cudnn.allow_tf32 = True
+            
+            torch.set_float32_matmul_precision('high')
+            torch.backends.cudnn.benchmark = True  # [속도 최적화] 입력 크기에 맞는 최적 알고리즘 자동 선택
+            torch._dynamo.config.capture_scalar_outputs = True
+
             print("  [가속화] cuDNN Benchmark: ON | TF32 MatMul: ON | TF32 cuDNN: ON")
         
-        # 클래스 가중치 설정: O=1.0, B-HAL=5.0, I-HAL=1.5
-        class_weights = torch.tensor([1.0, 5.0, 1.5]).to(self.device)
+
+
+        # 클래스 가중치: 토큰 레벨 비율 기반 역가중치
+        # Normal(0): 46.4%, Halluc(1): 53.6% → 역비율 보정
+        class_weights = torch.tensor([53.6 / 46.4, 46.4 / 53.6]).to(device)
+        # = [1.155, 0.866] → 소수 클래스(Normal)에 약간 더 가중
+        print(f"  Class Weights: {class_weights.tolist()}")
+        
         self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights, 
+            weight=class_weights,
             ignore_index=-100,
-            label_smoothing=0.1
+            label_smoothing=0.001
         )
-        print(f"   Class weights applied: O=1.0, B-HAL=5.0, I-HAL=1.5 | Label Smoothing: 0.1")
+        print(f"  Label Smoothing: 0.001")
         
         # 학습 히스토리 기록용
         self.history = {
@@ -54,8 +66,23 @@ class TokenTrainer:
             "train_recall": [],
             "val_loss": [],
             "val_f1": [],
+            "val_acc": [],
             "lr": []
         }
+
+        # script 디렉토리 생성 및 로그 파일 초기화
+        os.makedirs(self.script_dir, exist_ok=True)
+        self.log_path = os.path.join(self.script_dir, "training_log.txt")
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write(f"{'='*80}\n")
+            f.write(f"  Token Hallucination Detection — Training Log\n")
+            f.write(f"  Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"{'='*80}\n\n")
+            if self.hyperparams:
+                f.write("[Hyperparameters]\n")
+                for k, v in self.hyperparams.items():
+                    f.write(f"  {k}: {v}\n")
+                f.write("\n")
 
     def train(self, train_loader, epochs, val_loader=None):
         # Accelerate가 모델을 이미 올바른 디바이스에 배치함
@@ -121,11 +148,12 @@ class TokenTrainer:
             
             # Epoch 단위의 정확도(Acc) 및 F1 스코어 계산 (Hallucination 탐지이므로 macro f1 권장)
             acc = accuracy_score(all_labels, all_preds)
-            precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, labels=[1, 2], average='micro', zero_division=0)
+            precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average='binary', pos_label=1, zero_division=0)
             
             # Validation 평가 (Loss + F1)
             val_loss = None
             val_f1 = None
+            val_acc = None
             if val_loader:
                 self.model.eval()
                 val_total_loss = 0
@@ -148,8 +176,9 @@ class TokenTrainer:
                         val_labels.extend(v_labels[v_valid])
                 
                 val_loss = val_total_loss / len(val_loader)
+                val_acc = accuracy_score(val_labels, val_preds)
                 _, _, val_f1, _ = precision_recall_fscore_support(
-                    val_labels, val_preds, labels=[1, 2], average='micro', zero_division=0
+                    val_labels, val_preds, average='binary', pos_label=1, zero_division=0
                 )
             
             # 히스토리 기록
@@ -161,25 +190,26 @@ class TokenTrainer:
             self.history["train_recall"].append(recall)
             self.history["val_loss"].append(val_loss if val_loss is not None else None)
             self.history["val_f1"].append(val_f1 if val_f1 is not None else None)
+            self.history["val_acc"].append(val_acc if val_acc is not None else None)
             self.history["lr"].append(current_lr)
             
             # 결과 출력
             val_str = ""
             if val_loss is not None:
-                val_str = f" | Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}"
-            print(f"Epoch {ep+1} | LR: {current_lr:.2e} | Loss: {avg_loss:.4f}{val_str} | Train Acc: {acc:.4f} | Train F1: {f1:.4f} | Prec: {precision:.4f} | Rec: {recall:.4f}")
+                val_str = f" | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}"
+            epoch_summary = f"Epoch {ep+1}/{epochs} | LR: {current_lr:.2e} | Loss: {avg_loss:.4f}{val_str} | Train Acc: {acc:.4f} | Train F1: {f1:.4f} | Prec: {precision:.4f} | Rec: {recall:.4f}"
+            print(epoch_summary)
+            
+            # 에폭 로그를 파일에 저장
+            self._write_epoch_log(ep + 1, epochs, current_lr, avg_loss, acc, f1, precision, recall, val_loss, val_acc, val_f1)
+            
+            # 매 에폭마다 히스토리 JSON + 플롯 저장 (1에폭 ~ 현재 에폭까지 누적)
+            self._save_and_plot_history()
             
             # 모델 저장 및 Early Stopping (Val F1 기준)
             if val_f1 is not None:
                 if val_f1 > self.best_val_f1:
                     self._save_checkpoint(self.output_dir, ep + 1, val_f1, val_loss, avg_loss, f1)
-                    early_stop_counter = 0
-                else:
-                    early_stop_counter += 1
-                    print(f" >>> Val F1 did not improve. Early stopping counter: {early_stop_counter}/{self.patience}")
-                    if early_stop_counter >= self.patience:
-                        print(f"Early Stopping triggered at Epoch {ep+1}!")
-                        break
             else:
                 # Validation이 없는 경우 매 에폭 저장
                 self._save_checkpoint(self.output_dir, ep + 1, 0, 0, avg_loss, f1)
@@ -191,8 +221,13 @@ class TokenTrainer:
         print(f" >>> Saving final model to {final_dir}...")
         self._save_checkpoint(final_dir, epochs, self.best_val_f1, 0, avg_loss, f1)
         
-        # 학습 히스토리 저장 및 시각화
-        self._save_and_plot_history()
+        # 로그 마무리
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*80}\n")
+            f.write(f"  Training Completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"  Best Val F1: {self.best_val_f1:.4f}\n")
+            f.write(f"{'='*80}\n")
+        print(f"  학습 로그 저장 완료: {self.log_path}")
 
     def _save_checkpoint(self, save_dir, epoch, val_f1, val_loss, train_loss, train_f1):
         """모델, 옵티마이저, 메타데이터 등을 지정된 디렉토리에 저장합니다."""
@@ -227,12 +262,58 @@ class TokenTrainer:
         with open(os.path.join(save_dir, "training_meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=3, ensure_ascii=False)
 
+    def _write_epoch_log(self, epoch, total_epochs, lr, train_loss, train_acc, train_f1, precision, recall, val_loss, val_acc, val_f1):
+        """에폭별 로그를 파일에 기록합니다."""
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(f"{'─'*60}\n")
+            f.write(f"  Epoch {epoch}/{total_epochs}  |  {datetime.now().strftime('%H:%M:%S')}\n")
+            f.write(f"{'─'*60}\n")
+            f.write(f"  Learning Rate : {lr:.2e}\n")
+            f.write(f"  Train Loss    : {train_loss:.6f}\n")
+            f.write(f"  Train Acc     : {train_acc:.4f}\n")
+            f.write(f"  Train F1      : {train_f1:.4f}\n")
+            f.write(f"  Precision     : {precision:.4f}\n")
+            f.write(f"  Recall        : {recall:.4f}\n")
+            if val_loss is not None:
+                f.write(f"  Val Loss      : {val_loss:.6f}\n")
+                f.write(f"  Val Acc       : {val_acc:.4f}\n")
+                f.write(f"  Val F1        : {val_f1:.4f}\n")
+            # 변화율 기록 (2번째 에폭부터)
+            if epoch >= 2:
+                prev = len(self.history["train_loss"]) - 1  # 이전 에폭 인덱스 (이미 append된 상태)
+                # 이전 값 가져오기 (현재 에폭은 이미 history에 추가됨)
+                prev_train_loss = self.history["train_loss"][prev - 1] if prev > 0 else self.history["train_loss"][0]
+                prev_lr = self.history["lr"][prev - 1] if prev > 0 else self.history["lr"][0]
+                prev_train_acc = self.history["train_acc"][prev - 1] if prev > 0 else self.history["train_acc"][0]
+                prev_train_f1 = self.history["train_f1"][prev - 1] if prev > 0 else self.history["train_f1"][0]
+                
+                f.write(f"  ---- 변화율 (vs Epoch {epoch-1}) ----\n")
+                lr_delta = lr - prev_lr
+                loss_delta = train_loss - prev_train_loss
+                acc_delta = train_acc - prev_train_acc
+                f1_delta = train_f1 - prev_train_f1
+                f.write(f"  LR  변화    : {lr_delta:+.2e}\n")
+                f.write(f"  Loss 변화   : {loss_delta:+.6f} ({'↓' if loss_delta < 0 else '↑'})\n")
+                f.write(f"  Acc  변화   : {acc_delta:+.4f} ({'↑' if acc_delta > 0 else '↓'})\n")
+                f.write(f"  F1   변화   : {f1_delta:+.4f} ({'↑' if f1_delta > 0 else '↓'})\n")
+                if val_loss is not None and self.history["val_loss"][prev - 1] is not None:
+                    prev_val_loss = self.history["val_loss"][prev - 1]
+                    prev_val_acc = self.history["val_acc"][prev - 1]
+                    prev_val_f1 = self.history["val_f1"][prev - 1]
+                    val_loss_delta = val_loss - prev_val_loss
+                    val_acc_delta = val_acc - prev_val_acc
+                    val_f1_delta = val_f1 - prev_val_f1
+                    f.write(f"  Val Loss 변화: {val_loss_delta:+.6f} ({'↓' if val_loss_delta < 0 else '↑'})\n")
+                    f.write(f"  Val Acc  변화: {val_acc_delta:+.4f} ({'↑' if val_acc_delta > 0 else '↓'})\n")
+                    f.write(f"  Val F1   변화: {val_f1_delta:+.4f} ({'↑' if val_f1_delta > 0 else '↓'})\n")
+            f.write("\n")
+
     def _save_and_plot_history(self):
-        """학습 히스토리를 JSON으로 저장하고, 성능 변화 그래프를 생성합니다."""
-        os.makedirs(self.output_dir, exist_ok=True)
+        """학습 히스토리를 JSON으로 저장하고, 성능 변화 그래프를 script 디렉토리에 생성합니다."""
+        os.makedirs(self.script_dir, exist_ok=True)
         
-        # JSON 히스토리 저장
-        history_path = os.path.join(self.output_dir, "training_history.json")
+        # JSON 히스토리 저장 (script 디렉토리)
+        history_path = os.path.join(self.script_dir, "training_history.json")
         with open(history_path, "w", encoding="utf-8") as f:
             json.dump(self.history, f, indent=4, ensure_ascii=False)
         print(f"  학습 히스토리 저장 완료: {history_path}")
@@ -247,20 +328,21 @@ class TokenTrainer:
         
         # 스타일 설정
         plt.style.use('seaborn-v0_8-darkgrid')
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(3, 2, figsize=(18, 20))
         fig.suptitle('Token Hallucination Detection — Training Report', 
-                     fontsize=16, fontweight='bold', y=0.98)
+                     fontsize=18, fontweight='bold', y=0.98)
         
         colors = {
             'train': '#2196F3',       # Blue
             'val': '#FF5722',         # Deep Orange
             'acc': '#4CAF50',         # Green
+            'val_acc': '#E91E63',     # Pink
             'precision': '#9C27B0',   # Purple
             'recall': '#FF9800',      # Orange
             'lr': '#607D8B',          # Blue Grey
         }
         
-        # ── 1. Loss 곡선 ──
+        # ── 1. Train / Val Loss 곡선 ──
         ax1 = axes[0, 0]
         ax1.plot(epochs_range, self.history["train_loss"], 
                  marker='o', color=colors['train'], linewidth=2, markersize=6, label='Train Loss')
@@ -269,7 +351,7 @@ class TokenTrainer:
             val_epochs = [e for e, v in zip(epochs_range, self.history["val_loss"]) if v is not None]
             ax1.plot(val_epochs, val_losses, 
                      marker='s', color=colors['val'], linewidth=2, markersize=6, label='Val Loss')
-        ax1.set_title('Loss', fontsize=13, fontweight='bold')
+        ax1.set_title('Loss', fontsize=14, fontweight='bold')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Loss')
         ax1.legend(fontsize=10)
@@ -292,43 +374,103 @@ class TokenTrainer:
                             xytext=(10, 10), textcoords='offset points',
                             fontsize=10, fontweight='bold', color=colors['val'],
                             arrowprops=dict(arrowstyle='->', color=colors['val']))
-        ax2.set_title('F1 Score (Micro, Labels=[1,2])', fontsize=13, fontweight='bold')
+        ax2.set_title('F1 Score (Binary, pos_label=1)', fontsize=14, fontweight='bold')
         ax2.set_xlabel('Epoch')
         ax2.set_ylabel('F1 Score')
         ax2.legend(fontsize=10)
         ax2.set_xticks(epochs_range)
         ax2.set_ylim(0, 1.05)
         
-        # ── 3. Precision / Recall / Accuracy 곡선 ──
+        # ── 3. Train / Val Accuracy 곡선 ──
         ax3 = axes[1, 0]
         ax3.plot(epochs_range, self.history["train_acc"], 
-                 marker='o', color=colors['acc'], linewidth=2, markersize=6, label='Accuracy')
-        ax3.plot(epochs_range, self.history["train_precision"], 
-                 marker='^', color=colors['precision'], linewidth=2, markersize=6, label='Precision')
-        ax3.plot(epochs_range, self.history["train_recall"], 
-                 marker='v', color=colors['recall'], linewidth=2, markersize=6, label='Recall')
-        ax3.set_title('Train Metrics', fontsize=13, fontweight='bold')
+                 marker='o', color=colors['acc'], linewidth=2, markersize=6, label='Train Acc')
+        if has_val:
+            val_accs = [v for v in self.history["val_acc"] if v is not None]
+            val_acc_epochs = [e for e, v in zip(epochs_range, self.history["val_acc"]) if v is not None]
+            if val_accs:
+                ax3.plot(val_acc_epochs, val_accs,
+                         marker='s', color=colors['val_acc'], linewidth=2, markersize=6, label='Val Acc')
+        ax3.set_title('Accuracy', fontsize=14, fontweight='bold')
         ax3.set_xlabel('Epoch')
-        ax3.set_ylabel('Score')
+        ax3.set_ylabel('Accuracy')
         ax3.legend(fontsize=10)
         ax3.set_xticks(epochs_range)
         ax3.set_ylim(0, 1.05)
         
-        # ── 4. Learning Rate 곡선 ──
+        # ── 4. Precision / Recall 곡선 ──
         ax4 = axes[1, 1]
-        ax4.plot(epochs_range, self.history["lr"], 
-                 marker='D', color=colors['lr'], linewidth=2, markersize=6, label='Learning Rate')
-        ax4.set_title('Learning Rate Schedule', fontsize=13, fontweight='bold')
+        ax4.plot(epochs_range, self.history["train_precision"], 
+                 marker='^', color=colors['precision'], linewidth=2, markersize=6, label='Precision')
+        ax4.plot(epochs_range, self.history["train_recall"], 
+                 marker='v', color=colors['recall'], linewidth=2, markersize=6, label='Recall')
+        ax4.set_title('Precision & Recall', fontsize=14, fontweight='bold')
         ax4.set_xlabel('Epoch')
-        ax4.set_ylabel('Learning Rate')
+        ax4.set_ylabel('Score')
         ax4.legend(fontsize=10)
         ax4.set_xticks(epochs_range)
-        ax4.ticklabel_format(axis='y', style='scientific', scilimits=(0,0))
+        ax4.set_ylim(0, 1.05)
         
-        # 레이아웃 및 저장
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        # ── 5. Learning Rate 곡선 ──
+        ax5 = axes[2, 0]
+        ax5.plot(epochs_range, self.history["lr"], 
+                 marker='D', color=colors['lr'], linewidth=2, markersize=6, label='Learning Rate')
+        ax5.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+        ax5.set_xlabel('Epoch')
+        ax5.set_ylabel('Learning Rate')
+        ax5.legend(fontsize=10)
+        ax5.set_xticks(epochs_range)
+        ax5.ticklabel_format(axis='y', style='scientific', scilimits=(0,0))
+        
+        # ── 6. 변화율 (Delta) 테이블 ──
+        ax6 = axes[2, 1]
+        ax6.axis('off')
+        if len(epochs_range) >= 2:
+            # 변화율 데이터 준비
+            delta_rows = []
+            for i in range(1, len(epochs_range)):
+                ep = epochs_range[i]
+                lr_d = self.history["lr"][i] - self.history["lr"][i-1]
+                tl_d = self.history["train_loss"][i] - self.history["train_loss"][i-1]
+                ta_d = self.history["train_acc"][i] - self.history["train_acc"][i-1]
+                tf_d = self.history["train_f1"][i] - self.history["train_f1"][i-1]
+                
+                row = [
+                    f"{ep-1}→{ep}",
+                    f"{lr_d:+.1e}",
+                    f"{tl_d:+.4f}",
+                    f"{ta_d:+.4f}",
+                    f"{tf_d:+.4f}",
+                ]
+                if has_val and self.history["val_loss"][i] is not None and self.history["val_loss"][i-1] is not None:
+                    vl_d = self.history["val_loss"][i] - self.history["val_loss"][i-1]
+                    va_d = self.history["val_acc"][i] - self.history["val_acc"][i-1]
+                    vf_d = self.history["val_f1"][i] - self.history["val_f1"][i-1]
+                    row.extend([f"{vl_d:+.4f}", f"{va_d:+.4f}", f"{vf_d:+.4f}"])
+                delta_rows.append(row)
+            
+            col_labels = ["Epoch", "ΔLR", "ΔT.Loss", "ΔT.Acc", "ΔT.F1"]
+            if has_val:
+                col_labels.extend(["ΔV.Loss", "ΔV.Acc", "ΔV.F1"])
+            
+            table = ax6.table(cellText=delta_rows, colLabels=col_labels, 
+                             loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.0, 1.4)
+            # 헤더 색상
+            for j in range(len(col_labels)):
+                table[0, j].set_facecolor('#37474F')
+                table[0, j].set_text_props(color='white', fontweight='bold')
+            ax6.set_title('Epoch-wise Delta (변화율)', fontsize=14, fontweight='bold', pad=20)
+        else:
+            ax6.text(0.5, 0.5, 'Not enough epochs\nfor delta calculation', 
+                    ha='center', va='center', fontsize=12, color='gray')
+        
+        # 레이아웃 및 저장 (script 디렉토리)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plot_path = os.path.join(self.output_dir, f"training_plot_{timestamp}.png")
+        plot_path = os.path.join(self.script_dir, f"training_plot_{timestamp}.png")
         fig.savefig(plot_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close(fig)
         print(f"   학습 성능 그래프 저장 완료: {plot_path}")
